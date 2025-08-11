@@ -1,0 +1,191 @@
+𝐒𝐓𝐄𝐏𝟏:-
+
+spring:
+ cloud:
+   gateway:
+     routes:
+       - id: swiggy-app
+         uri: lb://SWIGGY-APP
+         predicates:
+           - Path=/swiggy/**
+         filters:
+           - AuthenticationFilter
+
+
+       - id: restaurant-service
+         uri: lb://RESTAURANT-SERVICE
+         predicates:
+           - Path=/restaurant/**
+         filters:
+           - AuthenticationFilter
+
+       - id: identity-service
+         uri: lb://IDENTITY-SERVICE
+         predicates:
+           - Path=/auth/**
+
+ application:
+   name: SWIGGY-GATEWAY
+
+eureka:
+  client:
+    service-url:
+      defaultZone : http://localhost:8761/eureka/
+
+
+
+
+
+𝐒𝐓𝐄𝐏 𝟐:-
+
+package com.javatechie.config;
+
+import org.springframework.context.annotation.Bean;
+import org.springframework.context.annotation.Configuration;
+import org.springframework.web.client.RestTemplate;
+
+@Configuration
+public class AppConfig {
+
+    @Bean
+    public RestTemplate template(){
+       return new RestTemplate();
+    }
+}
+
+
+
+
+
+
+𝐒𝐓𝐄𝐏 𝟑:-
+
+package com.javatechie.filter;
+
+import org.springframework.http.server.reactive.ServerHttpRequest;
+import org.springframework.stereotype.Component;
+
+import java.util.*;
+import java.util.function.Predicate;
+
+@Component
+public class RouteValidator {
+
+    public static final List<String> openApiEndpoints = List.of(
+            "/auth/register",
+            "/auth/token",
+            "/eureka"
+    );
+
+    public Predicate<ServerHttpRequest> isSecured =
+            request -> openApiEndpoints
+                    .stream()
+                    .noneMatch(uri -> request.getURI().getPath().contains(uri));
+
+}
+
+
+
+
+
+
+𝐒𝐓𝐄𝐏 𝟒:-
+
+package com.javatechie.filter;
+
+import com.javatechie.util.JwtUtil;
+import org.springframework.beans.factory.annotation.Autowired;
+import org.springframework.cloud.gateway.filter.GatewayFilter;
+import org.springframework.cloud.gateway.filter.factory.AbstractGatewayFilterFactory;
+import org.springframework.http.HttpHeaders;
+import org.springframework.stereotype.Component;
+import org.springframework.web.client.RestTemplate;
+
+@Component
+public class AuthenticationFilter extends AbstractGatewayFilterFactory<AuthenticationFilter.Config> {
+
+    @Autowired
+    private RouteValidator validator;
+
+    //    @Autowired
+//    private RestTemplate template;
+    @Autowired
+    private JwtUtil jwtUtil;
+
+    public AuthenticationFilter() {
+        super(Config.class);
+    }
+
+    @Override
+    public GatewayFilter apply(Config config) {
+        return ((exchange, chain) -> {
+            if (validator.isSecured.test(exchange.getRequest())) {
+                //header contains token or not
+                if (!exchange.getRequest().getHeaders().containsKey(HttpHeaders.AUTHORIZATION)) {
+                    throw new RuntimeException("missing authorization header");
+                }
+
+                String authHeader = exchange.getRequest().getHeaders().get(HttpHeaders.AUTHORIZATION).get(0);
+                if (authHeader != null && authHeader.startsWith("Bearer ")) {
+                    authHeader = authHeader.substring(7);
+                }
+                try {
+//                    //REST call to AUTH service
+//                    template.getForObject("http://IDENTITY-SERVICE//validate?token" + authHeader, String.class);
+                    jwtUtil.validateToken(authHeader);
+
+                } catch (Exception e) {
+                    System.out.println("invalid access...!");
+                    throw new RuntimeException("un authorized access to application");
+                }
+            }
+            return chain.filter(exchange);
+        });
+    }
+
+    public static class Config {
+
+    }
+}
+
+
+
+
+
+
+𝐒𝐓𝐄𝐏 5:-
+
+
+package com.javatechie.util;
+
+import io.jsonwebtoken.Jwts;
+import io.jsonwebtoken.SignatureAlgorithm;
+import io.jsonwebtoken.io.Decoders;
+import io.jsonwebtoken.security.Keys;
+import org.springframework.stereotype.Component;
+
+import java.security.Key;
+import java.util.Date;
+import java.util.HashMap;
+import java.util.Map;
+
+@Component
+public class JwtUtil {
+
+
+    public static final String SECRET = "5367566B59703373367639792F423F4528482B4D6251655468576D5A71347437";
+
+
+    public void validateToken(final String token) {
+        Jwts.parserBuilder().setSigningKey(getSignKey()).build().parseClaimsJws(token);
+    }
+
+
+
+    private Key getSignKey() {
+        byte[] keyBytes = Decoders.BASE64.decode(SECRET);
+        return Keys.hmacShaKeyFor(keyBytes);
+    }
+}
+
+
