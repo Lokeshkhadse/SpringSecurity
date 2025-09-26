@@ -1,0 +1,209 @@
+  
+🔄 JWT + Refresh Token Flow
+1. User Login
+
+User sends credentials (username + password) → /auth/login.
+
+Backend:
+
+Validates credentials.
+
+Generates:
+
+Access Token → short-lived (e.g., 15 min).
+
+Refresh Token → long-lived (e.g., 7 days).
+
+Stores refresh token in DB (with userId, expiry, status).
+
+Sends access token in response body and refresh token in HttpOnly, Secure cookie.
+
+2. User Uses Access Token
+
+For every API request, client includes access token in Authorization: Bearer <token>.
+
+Backend verifies:
+
+Signature.
+
+Expiry.
+
+If valid → allow request.
+
+If expired → client must use refresh token.
+
+3. Access Token Expired → Refresh Needed
+
+Client calls /auth/refresh.
+
+Sends refresh token (from HttpOnly cookie).
+
+4. Backend Validates Refresh Token
+
+Checks:
+
+Signature of JWT refresh token.
+
+If refresh token exists in DB and is not expired/revoked.
+
+If invalid → respond with 401 Unauthorized.
+
+5. Issue New Tokens
+
+If refresh token is valid:
+
+Generate new access token.
+
+Generate new refresh token.
+
+Update DB:
+
+Mark old refresh token as invalid/revoked.
+
+Save new refresh token.
+
+Send back:
+
+New access token (response body).
+
+New refresh token (set in HttpOnly cookie).
+
+6. User Continues with New Tokens
+
+User uses the new access token for API calls.
+
+Refresh token is rotated → prevents token replay attacks.
+
+If refresh token also expires → user must login again.
+
+📊 Example Flow (Visual)
+Step	Who	Action	Token Handling
+1	User → Server	Login with credentials	Server generates Access + Refresh
+2	Server → User	Sends tokens	Access → body/header, Refresh → DB + HttpOnly Cookie
+3	User → Server	Calls API with access token	Server validates access token
+4	Server	If expired → rejects request	Client needs refresh
+5	User → Server	Calls /auth/refresh	Sends refresh token (cookie)
+6	Server	Validates refresh token	Check DB + expiry
+7	Server	Issues new tokens	Access token + Refresh token (rotated)
+8	User → Server	Continues with new access token	Old refresh token revoked
+
+
+
+@PostMapping("/refresh")
+public ResponseEntity<?> refreshToken(HttpServletRequest request, HttpServletResponse response) {
+    String refreshToken = extractFromCookie(request); // Or Authorization header
+
+    if(refreshToken != null && jwtService.validateRefreshToken(refreshToken)) {
+        String username = jwtService.extractUsername(refreshToken);
+
+        // check DB if refresh token is still valid
+        if(refreshTokenService.isValid(username, refreshToken)) {
+
+            // generate new access + refresh tokens
+            String newAccessToken = jwtService.generateAccessToken(username);
+            String newRefreshToken = jwtService.generateRefreshToken(username);
+
+            // update DB (invalidate old refresh, save new one)
+            refreshTokenService.rotate(username, refreshToken, newRefreshToken);
+
+            // set refresh in HttpOnly cookie again
+            setRefreshTokenCookie(response, newRefreshToken);
+
+            return ResponseEntity.ok(Map.of(
+                "accessToken", newAccessToken
+            ));
+        }
+    }
+
+    return ResponseEntity.status(HttpStatus.UNAUTHORIZED).body("Invalid refresh token");
+}
+
+
+
+public String generateAccessToken(User user) {
+    return Jwts.builder()
+            .setSubject(user.getUsername())
+            .setIssuedAt(new Date())
+            .setExpiration(new Date(System.currentTimeMillis() + accessTokenValidity))
+            .signWith(SignatureAlgorithm.HS256, secretKey)
+            .compact();
+}
+
+public String generateRefreshToken(User user) {
+    return Jwts.builder()
+            .setSubject(user.getUsername())
+            .setIssuedAt(new Date())
+            .setExpiration(new Date(System.currentTimeMillis() + refreshTokenValidity))
+            .signWith(SignatureAlgorithm.HS256, secretKey)
+            .compact();
+}
+
+public Duration getRefreshTokenValidity() {
+    return Duration.ofDays(7); // 7 days
+}
+
+
+@PostMapping("/login")
+public ResponseEntity<?> login(@RequestBody LoginRequest request, HttpServletResponse response) {
+    Map<String, String> tokens = authService.login(request.getUsername(), request.getPassword());
+
+    Cookie cookie = new Cookie("refreshToken", tokens.get("refreshToken"));
+    cookie.setHttpOnly(true);
+    cookie.setSecure(true);
+    cookie.setPath("/auth/refresh"); // only sent to refresh endpoint
+    cookie.setMaxAge(7 * 24 * 60 * 60); // 7 days
+    response.addCookie(cookie);
+
+    return ResponseEntity.ok(Map.of("accessToken", tokens.get("accessToken")));
+}
+
+
+@Service
+public class AuthService {
+
+    @Autowired
+    private UserRepository userRepository;
+
+    @Autowired
+    private JwtService jwtService;
+
+    @Autowired
+    private RefreshTokenRepository refreshTokenRepository;
+
+    @Autowired
+    private PasswordEncoder passwordEncoder;
+
+    public Map<String, String> login(String username, String password) {
+        // 1️⃣ Fetch user
+        User user = userRepository.findByUsername(username)
+                .orElseThrow(() -> new RuntimeException("Invalid credentials"));
+
+        // 2️⃣ Validate password
+        if (!passwordEncoder.matches(password, user.getPassword())) {
+            throw new RuntimeException("Invalid credentials");
+        }
+
+        // 3️⃣ Generate Access Token (short-lived)
+        String accessToken = jwtService.generateAccessToken(user);
+
+        // 4️⃣ Generate Refresh Token (long-lived)
+        String refreshToken = jwtService.generateRefreshToken(user);
+
+        // 5️⃣ Store refresh token in DB
+        RefreshToken tokenEntity = new RefreshToken();
+        tokenEntity.setUser(user);
+        tokenEntity.setToken(refreshToken);
+        tokenEntity.setExpiryDate(
+                Instant.now().plus(jwtService.getRefreshTokenValidity())
+        );
+        tokenEntity.setRevoked(false);
+        refreshTokenRepository.save(tokenEntity);
+
+        // 6️⃣ Return both tokens (refresh token should be stored as HttpOnly cookie in Controller)
+        Map<String, String> tokens = new HashMap<>();
+        tokens.put("accessToken", accessToken);
+        tokens.put("refreshToken", refreshToken); // Controller will put this in HttpOnly cookie
+
+        return tokens;
+    }
+}
